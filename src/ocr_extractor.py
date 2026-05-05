@@ -145,7 +145,7 @@ def _extract_lines_from_payload(payload: dict) -> list[list[CharacterBox]]:
                 CharacterBox(
                     id=char_id,
                     char=char,
-                    box=_normalize_box(raw_box),
+                    box=_normalize_character_box(raw_box, line_box),
                     line_id=line_id,
                     char_index=char_index,
                     global_char_index=global_char_index,
@@ -245,6 +245,51 @@ def _normalize_box(raw_box: Any) -> list[list[float]]:
         normalized.append([float(point[0]), float(point[1])])
 
     return normalized
+
+
+def _normalize_character_box(raw_box: Any, line_box: list[list[float]]) -> list[list[float]]:
+    box = _to_plain_py_list(raw_box)
+    if _is_rect_like(box):
+        return _orient_rect_box_to_line(box, line_box)
+
+    return _normalize_box(box)
+
+
+def _orient_rect_box_to_line(
+    rect_box: list[float],
+    line_box: list[list[float]],
+) -> list[list[float]]:
+    if len(line_box) != 4:
+        raise RuntimeError(f"Expected OCR line polygon to contain 4 points, found {len(line_box)}.")
+
+    x1, _, x2, _ = [float(value) for value in rect_box]
+    top_left, top_right, bottom_right, bottom_left = line_box
+
+    return [
+        _point_at_x(top_left, top_right, x1),
+        _point_at_x(top_left, top_right, x2),
+        _point_at_x(bottom_left, bottom_right, x2),
+        _point_at_x(bottom_left, bottom_right, x1),
+    ]
+
+
+def _point_at_x(
+    start: list[float],
+    end: list[float],
+    x: float,
+    eps: float = 1e-8,
+) -> list[float]:
+    start_x = float(start[0])
+    end_x = float(end[0])
+    dx = end_x - start_x
+    if abs(dx) < eps:
+        raise RuntimeError("Cannot orient character box on a near-vertical OCR line edge.")
+
+    t = (x - start_x) / dx
+    return [
+        float(start[0]) + t * (float(end[0]) - float(start[0])),
+        float(start[1]) + t * (float(end[1]) - float(start[1])),
+    ]
 
 
 def _is_rect_like(value: Any) -> bool:

@@ -1,27 +1,41 @@
-from paddleocr import PaddleOCR
+import argparse
 
-ocr = PaddleOCR(
-    text_detection_model_name="PP-OCRv5_mobile_det",
-    text_recognition_model_name="PP-OCRv5_mobile_rec",
-    use_doc_orientation_classify=False,
-    use_doc_unwarping=False,
-    use_textline_orientation=False,
-    return_word_box=True,
-)
+from src.debug_draw import draw_segmented_word_boxes
+from src.ocr_extractor import OCRExtractor
+from src.segmenter import add_custom_words, iter_word_instances, segment_ocr_page
 
-results = ocr.predict("./test-images/t1.jpg")
 
-for res in results:
-    data = res.json["res"]
+DEFAULT_CUSTOM_WORDS = [
+    "学生证",
+    "刘海",
+    "学生会",
+    "名字",
+    "照照片",
+]
 
-    print(data.keys())
 
-    rec_texts = data.get("rec_texts", [])
-    text_words = data.get("text_word", [])
-    text_word_boxes = data.get("text_word_boxes", [])
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run PaddleOCR + Jieba segmentation and draw colored word boxes."
+    )
+    parser.add_argument("image", help="Input image path.")
+    parser.add_argument("output", help="Output debug image path.")
+    args = parser.parse_args()
 
-    for line_text, chars, char_boxes in zip(rec_texts, text_words, text_word_boxes):
-        print("LINE:", line_text)
+    extractor = OCRExtractor()
+    page = extractor.extract_page(args.image)
 
-        for ch, box in zip(chars, char_boxes):
-            print(ch, box)
+    add_custom_words(DEFAULT_CUSTOM_WORDS)
+    segment_ocr_page(page)
+    draw_segmented_word_boxes(args.image, page, args.output)
+
+    print("FULL TEXT:")
+    print(page.full_text)
+    print()
+    print(f"Characters: {len(page.characters)}")
+    print(f"Words: {len(iter_word_instances(page))}")
+    print(f"Saved colored word boxes: {args.output}")
+
+
+if __name__ == "__main__":
+    main()

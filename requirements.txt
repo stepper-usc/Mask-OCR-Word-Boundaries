@@ -1,6 +1,7 @@
 paddleocr==3.5.0
 paddlepaddle
 jieba>=0.42.1
+mediapipe
 numpy
 opencv-python
 pillow
