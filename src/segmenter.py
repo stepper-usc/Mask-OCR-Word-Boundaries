@@ -1,5 +1,3 @@
-from collections import defaultdict
-
 import jieba
 
 from .models import CharacterBox, OCRPage
@@ -15,13 +13,12 @@ def segment_ocr_page(page: OCRPage, mode: str = "line") -> OCRPage:
     if mode != "line":
         raise ValueError("Only mode='line' is currently supported. Segmenting by line preserves OCR line breaks.")
 
-    _validate_page_text_alignment(page)
     for char in page.characters:
         char.word = None
         char.word_instance_id = None
 
-    for line_id, line_chars in _characters_by_line(page.characters):
-        segment_line_with_indices(line_chars, line_id=line_id)
+    for line_chars in page.character_lines:
+        segment_line_with_indices(line_chars)
 
     unassigned = [char.id for char in page.characters if char.word is None or char.word_instance_id is None]
     if unassigned:
@@ -73,32 +70,6 @@ def segment_line_with_indices(line_chars: list[CharacterBox], line_id: int | Non
         )
 
 
-def find_character(page: OCRPage, line_id: int, char_index: int) -> CharacterBox | None:
-    for char in page.characters:
-        if char.line_id == line_id and char.char_index == char_index:
-            return char
-    return None
-
-
-def find_word_for_character(page: OCRPage, line_id: int, char_index: int) -> str | None:
-    char = find_character(page, line_id, char_index)
-    return None if char is None else char.word
-
-
-def get_characters_for_word_instance(
-    page: OCRPage,
-    word_instance_id: str,
-) -> list[CharacterBox]:
-    return [char for char in page.characters if char.word_instance_id == word_instance_id]
-
-
-def get_segmented_characters_for_word(
-    page: OCRPage,
-    word_instance_id: str,
-) -> list[CharacterBox]:
-    return get_characters_for_word_instance(page, word_instance_id)
-
-
 def iter_word_instances(page: OCRPage) -> list[tuple[str, str, list[CharacterBox]]]:
     word_instances: dict[str, list[CharacterBox]] = {}
     for char in page.characters:
@@ -115,21 +86,10 @@ def iter_word_instances(page: OCRPage) -> list[tuple[str, str, list[CharacterBox
     ]
 
 
-def _characters_by_line(characters: list[CharacterBox]) -> list[tuple[int, list[CharacterBox]]]:
-    grouped: dict[int, list[CharacterBox]] = defaultdict(list)
-    for char in characters:
-        grouped[char.line_id].append(char)
-
-    return [
-        (line_id, sorted(chars, key=lambda char: char.char_index))
-        for line_id, chars in sorted(grouped.items())
-    ]
-
-
-def _validate_page_text_alignment(page: OCRPage) -> None:
+def validate_page_text_alignment(page: OCRPage) -> None:
     derived_full_text = "\n".join(
         "".join(char.char for char in line_chars)
-        for _, line_chars in _characters_by_line(page.characters)
+        for line_chars in page.character_lines
     )
     if page.full_text != derived_full_text:
         raise RuntimeError(

@@ -1,4 +1,3 @@
-import logging
 from collections.abc import Sequence
 from typing import Any
 
@@ -7,7 +6,13 @@ from paddleocr import PaddleOCR
 from .models import CharacterBox, OCRPage
 
 
-logger = logging.getLogger(__name__)
+REQUIRED_PAYLOAD_KEYS = (
+    "rec_texts",
+    "rec_scores",
+    "rec_polys",
+    "text_word",
+    "text_word_boxes",
+)
 
 
 class OCRExtractor:
@@ -20,9 +25,13 @@ class OCRExtractor:
         return _payload_to_page(payload)
 
     def _predict(self, image_path: str) -> Any:
-        if hasattr(self.ocr, "predict") and callable(self.ocr.predict):
-            return self.ocr.predict(image_path)
-        return self.ocr.ocr(image_path)
+        if not hasattr(self.ocr, "predict") or not callable(self.ocr.predict):
+            raise RuntimeError(
+                "PaddleOCR engine does not expose predict(...). "
+                "This project expects PaddleOCR 3.5.0."
+            )
+
+        return self.ocr.predict(image_path)
 
 
 def create_ocr_engine() -> PaddleOCR:
@@ -40,150 +49,97 @@ def extract_ocr_page(image_path: str) -> OCRPage:
     return OCRExtractor().extract_page(image_path)
 
 
-def _payload_to_page(payload: dict) -> OCRPage:
-    character_lines = _extract_lines_from_payload(payload)
-    characters = [char for line_chars in character_lines for char in line_chars]
-    full_text = "\n".join("".join(char.char for char in line_chars) for line_chars in character_lines)
-
-    return OCRPage(full_text=full_text, characters=characters)
-
-
-def _result_to_dict(result: Any) -> dict:
-    if isinstance(result, dict):
-        return _to_plain(result)
-
-    json_payload = getattr(result, "json", None)
-    if json_payload is not None:
-        if callable(json_payload):
-            json_payload = json_payload()
-        if isinstance(json_payload, dict):
-            return _to_plain(json_payload)
-
-    for method_name in ("to_dict", "dict"):
-        method = getattr(result, method_name, None)
-        if callable(method):
-            value = method()
-            if isinstance(value, dict):
-                return _to_plain(value)
-
-    result_dict = getattr(result, "__dict__", None)
-    if isinstance(result_dict, dict) and result_dict:
-        return _to_plain(result_dict)
-
-    raise RuntimeError(f"Could not convert PaddleOCR result to a dictionary: {type(result)!r}")
-
-
 def _extract_result_payload(results: Any) -> dict:
-    if results is None:
+    if not isinstance(results, Sequence) or isinstance(results, (str, bytes, bytearray)):
+        raise RuntimeError("Expected PaddleOCR 3.5 predict(...) to return a non-empty sequence.")
+    if len(results) == 0:
         raise RuntimeError("PaddleOCR returned an empty OCR result.")
 
-    if isinstance(results, dict):
-        candidates = [results]
-    elif isinstance(results, Sequence) and not isinstance(results, (str, bytes, bytearray)):
-        if len(results) == 0:
-            raise RuntimeError("PaddleOCR returned an empty OCR result.")
-        candidates = list(results)
-    else:
-        candidates = [results]
+    result = results[0]
+    json_payload = getattr(result, "json", None)
+    if not isinstance(json_payload, dict):
+        raise RuntimeError("Expected PaddleOCR 3.5 result shape: results[0].json['res'].")
 
-    for candidate in candidates:
-        payload = _unwrap_payload(_result_to_dict(candidate))
-        if _contains_ocr_payload(payload):
-            return payload
+    payload = json_payload.get("res")
+    if not isinstance(payload, dict):
+        raise RuntimeError("Expected PaddleOCR 3.5 result shape: results[0].json['res'].")
 
-    available = [_sorted_keys(_unwrap_payload(_result_to_dict(candidate))) for candidate in candidates]
-    raise RuntimeError(f"PaddleOCR result did not contain an OCR payload. Available keys: {available}")
+    return payload
+
+
+def _payload_to_page(payload: dict) -> OCRPage:
+    character_lines = _extract_lines_from_payload(payload)
+    full_text = "\n".join("".join(char.char for char in line_chars) for line_chars in character_lines)
+
+    return OCRPage(full_text=full_text, character_lines=character_lines)
 
 
 def _extract_lines_from_payload(payload: dict) -> list[list[CharacterBox]]:
-    payload = _to_plain(payload)
-    rec_texts = _as_list(_first_present(payload, ("rec_texts", "texts", "text")))
-    text_words_raw = _first_present(payload, ("text_word", "text_words", "chars", "characters"))
+    _validate_required_payload_keys(payload)
 
-    if not rec_texts and text_words_raw is None:
-        logger.warning("PaddleOCR payload keys: %s", _sorted_keys(payload))
-        raise RuntimeError(
-            "PaddleOCR result did not contain recognized text or boxed character text. "
-            f"Available keys: {_sorted_keys(payload)}"
-        )
+    rec_texts = _to_plain_py_list(payload["rec_texts"])
+    rec_scores = _to_plain_py_list(payload["rec_scores"])
+    rec_polys = _to_plain_py_list(payload["rec_polys"])
+    text_words_by_line = _to_plain_py_list(payload["text_word"])
+    char_boxes_by_line = _to_plain_py_list(payload["text_word_boxes"])
 
-    raw_char_boxes = _first_present(payload, ("text_word_boxes", "char_boxes", "character_boxes"))
-    if raw_char_boxes is None:
-        logger.warning("PaddleOCR payload keys: %s", _sorted_keys(payload))
-        raise RuntimeError(
-            "PaddleOCR did not return character boxes. Confirm return_word_box=True and inspect result keys."
-        )
-
-    line_count = len(rec_texts) if rec_texts else _infer_line_count(raw_char_boxes, text_words_raw)
-    rec_scores = _as_list(_first_present(payload, ("rec_scores", "scores", "rec_confidences")))
-    line_boxes = _as_list(_first_present(payload, ("rec_polys", "dt_polys", "rec_boxes", "boxes")))
-    char_boxes_by_line = _normalize_line_items(raw_char_boxes, line_count, item_kind="boxes")
-    text_words_by_line = (
-        _normalize_line_items(text_words_raw, line_count, item_kind="text")
-        if text_words_raw is not None
-        else []
+    _validate_line_lists(
+        rec_texts=rec_texts,
+        rec_scores=rec_scores,
+        rec_polys=rec_polys,
+        text_words_by_line=text_words_by_line,
+        char_boxes_by_line=char_boxes_by_line,
     )
 
     character_lines: list[list[CharacterBox]] = []
     global_cursor = 0
 
-    for line_id in range(line_count):
-        raw_line_char_boxes = _sequence_get(char_boxes_by_line, line_id)
-        if raw_line_char_boxes is None:
+    for line_id, rec_line_text in enumerate(rec_texts):
+        rec_line_text = str(rec_line_text)
+        text_word_items = text_words_by_line[line_id]
+        line_char_boxes = char_boxes_by_line[line_id]
+
+        if not isinstance(text_word_items, list):
+            raise RuntimeError(f"Expected payload['text_word'][{line_id}] to be a list.")
+        if not isinstance(line_char_boxes, list):
+            raise RuntimeError(f"Expected payload['text_word_boxes'][{line_id}] to be a list.")
+        if len(text_word_items) != len(line_char_boxes):
             raise RuntimeError(
-                "PaddleOCR did not return character boxes. Confirm return_word_box=True and inspect result keys."
+                f"PaddleOCR text_word/box alignment mismatch for line {line_id}: "
+                f"text_word has {len(text_word_items)} items but text_word_boxes has "
+                f"{len(line_char_boxes)} boxes."
             )
 
-        line_char_boxes = _as_list(raw_line_char_boxes)
-        text_word_items = _sequence_get(text_words_by_line, line_id)
-        rec_line_text = _optional_str(_sequence_get(rec_texts, line_id))
-
-        shared_box_metadata: list[dict[str, Any]] = []
-        if text_word_items is not None:
-            line_chars, line_char_boxes, shared_box_metadata = _expand_text_words_and_boxes(
-                text_word_items,
-                line_char_boxes,
-                line_id,
-            )
-        elif rec_line_text is not None:
-            line_chars = list(rec_line_text)
-        else:
-            raise RuntimeError(
-                f"Missing recognized character text for line {line_id}. "
-                "Expected text_word or rec_texts in the PaddleOCR result."
-            )
-
-        if len(line_chars) != len(line_char_boxes):
-            raise RuntimeError(
-                f"Character/box alignment mismatch for line {line_id}: recognized boxed text has "
-                f"{len(line_chars)} characters but PaddleOCR returned {len(line_char_boxes)} boxes. "
-                f"boxed_text={''.join(line_chars)!r}"
-            )
-
-        boxed_line_text = "".join(line_chars)
-        if rec_line_text is not None and _candidate_text(rec_line_text) != _candidate_text(boxed_line_text):
+        boxed_line_text = "".join(str(item) for item in text_word_items)
+        rec_candidate_text = _candidate_text(rec_line_text)
+        boxed_candidate_text = _candidate_text(boxed_line_text)
+        if rec_candidate_text != boxed_candidate_text:
             raise RuntimeError(
                 f"PaddleOCR recognized text and boxed character text disagree for line {line_id}: "
-                f"rec_text={rec_line_text!r}, boxed_text={boxed_line_text!r}."
+                f"cleaned rec_text={rec_candidate_text!r}, cleaned boxed_text={boxed_candidate_text!r}."
             )
 
-        confidence = _optional_float(_sequence_get(rec_scores, line_id))
-        line_box = _optional_box(_sequence_get(line_boxes, line_id))
+        confidence = _required_float(rec_scores[line_id], f"rec_scores[{line_id}]")
+        line_box = _normalize_box(rec_polys[line_id])
         line_characters: list[CharacterBox] = []
 
-        for raw_char_index, (char, raw_box) in enumerate(zip(line_chars, line_char_boxes, strict=True)):
-            if not _is_candidate_character(char):
+        for raw_char_index, (text_word, raw_box) in enumerate(
+            zip(text_word_items, line_char_boxes, strict=True)
+        ):
+            candidate_chars = _candidate_text(str(text_word))
+            if candidate_chars == "":
                 continue
+            if len(candidate_chars) > 1:
+                raise RuntimeError(
+                    f"PaddleOCR returned multiple Han characters for one box on line {line_id}: "
+                    f"text_word[{raw_char_index}]={text_word!r}. "
+                    "This pipeline expects one selectable Han character per box."
+                )
 
+            char = candidate_chars
             char_index = len(line_characters)
             global_char_index = global_cursor + char_index
             char_id = f"l{line_id}_c{char_index}_g{global_char_index}"
-            metadata: dict[str, Any] = {"raw_char_index": raw_char_index}
-            if rec_line_text is not None:
-                metadata["rec_line_text"] = rec_line_text
-            if line_box is not None:
-                metadata["line_box"] = line_box
-            metadata.update(shared_box_metadata[raw_char_index] if shared_box_metadata else {})
 
             line_characters.append(
                 CharacterBox(
@@ -194,7 +150,12 @@ def _extract_lines_from_payload(payload: dict) -> list[list[CharacterBox]]:
                     char_index=char_index,
                     global_char_index=global_char_index,
                     confidence=confidence,
-                    metadata=metadata,
+                    metadata={
+                        "raw_char_index": raw_char_index,
+                        "rec_line_text": rec_line_text,
+                        "line_box": line_box,
+                        "source_text_word": str(text_word),
+                    },
                 )
             )
 
@@ -202,99 +163,49 @@ def _extract_lines_from_payload(payload: dict) -> list[list[CharacterBox]]:
             character_lines.append(line_characters)
             global_cursor += len(line_characters) + 1
 
+    if not character_lines:
+        raise RuntimeError("PaddleOCR returned no selectable Han character boxes.")
+
     return character_lines
 
 
-def _unwrap_payload(result_dict: dict) -> dict:
-    current = result_dict
-    for key in ("res", "result", "data"):
-        nested = current.get(key)
-        if isinstance(nested, dict):
-            current = nested
-    return current
-
-
-def _contains_ocr_payload(payload: dict) -> bool:
-    return any(key in payload for key in ("rec_texts", "texts", "text", "text_word", "text_word_boxes"))
-
-
-def _first_present(payload: dict, keys: tuple[str, ...]) -> Any:
-    for key in keys:
-        if key in payload:
-            return payload[key]
-    return None
-
-
-def _as_list(value: Any) -> list[Any]:
-    if value is None:
-        return []
-    value = _to_plain(value)
-    if isinstance(value, list):
-        return value
-    if isinstance(value, tuple):
-        return list(value)
-    return [value]
-
-
-def _normalize_line_items(value: Any, line_count: int, item_kind: str) -> list[Any]:
-    items = _as_list(value)
-    if line_count == 1 and items:
-        first = items[0]
-        if item_kind == "text" and all(isinstance(item, str) for item in items):
-            return [items]
-        if item_kind == "boxes" and _is_box_like(first):
-            return [items]
-    return items
-
-
-def _infer_line_count(raw_char_boxes: Any, text_words_raw: Any) -> int:
-    text_words = _as_list(text_words_raw)
-    if text_words and isinstance(text_words[0], list):
-        return len(text_words)
-
-    char_boxes = _as_list(raw_char_boxes)
-    if char_boxes and _is_box_like(char_boxes[0]):
-        return 1
-    return len(char_boxes)
-
-
-def _expand_text_words_and_boxes(
-    text_word_items: Any,
-    line_char_boxes: list[Any],
-    line_id: int,
-) -> tuple[list[str], list[Any], list[dict[str, Any]]]:
-    if isinstance(text_word_items, str):
-        text_items = list(text_word_items)
-    else:
-        text_items = [str(item) for item in _as_list(text_word_items)]
-
-    characters: list[str] = []
-    expanded_boxes: list[Any] = []
-    metadata: list[dict[str, Any]] = []
-
-    if len(text_items) != len(line_char_boxes):
+def _validate_required_payload_keys(payload: dict) -> None:
+    missing = [key for key in REQUIRED_PAYLOAD_KEYS if key not in payload]
+    if missing:
         raise RuntimeError(
-            f"PaddleOCR text_word/box alignment mismatch for line {line_id}: "
-            f"text_word has {len(text_items)} items but PaddleOCR returned {len(line_char_boxes)} boxes."
+            "Expected PaddleOCR 3.5 payload keys are missing: "
+            f"{missing}. Available keys: {_sorted_keys(payload)}"
         )
 
-    for source_index, (text, box) in enumerate(zip(text_items, line_char_boxes, strict=True)):
-        if text == "":
-            continue
 
-        for source_char_offset, char in enumerate(text):
-            characters.append(char)
-            expanded_boxes.append(box)
-            metadata.append(
-                {
-                    "source_text_word": text,
-                    "source_text_word_index": source_index,
-                    "source_text_word_char_offset": source_char_offset,
-                    "shares_box_with_text_word": len(text) > 1,
-                }
+def _validate_line_lists(
+    *,
+    rec_texts: Any,
+    rec_scores: Any,
+    rec_polys: Any,
+    text_words_by_line: Any,
+    char_boxes_by_line: Any,
+) -> None:
+    line_lists = {
+        "rec_texts": rec_texts,
+        "rec_scores": rec_scores,
+        "rec_polys": rec_polys,
+        "text_word": text_words_by_line,
+        "text_word_boxes": char_boxes_by_line,
+    }
+    for key, value in line_lists.items():
+        if not isinstance(value, list):
+            raise RuntimeError(f"Expected payload[{key!r}] to be a list.")
+
+    line_count = len(rec_texts)
+    if line_count == 0:
+        raise RuntimeError("PaddleOCR returned no recognized text lines.")
+
+    for key, value in line_lists.items():
+        if len(value) != line_count:
+            raise RuntimeError(
+                f"Expected payload[{key!r}] to contain {line_count} lines, found {len(value)}."
             )
-
-    return characters, expanded_boxes, metadata
 
 
 def _candidate_text(text: str) -> str:
@@ -318,14 +229,8 @@ def _is_candidate_character(char: str) -> bool:
     )
 
 
-def _optional_box(raw_box: Any) -> list[list[float]] | None:
-    if raw_box is None:
-        return None
-    return _normalize_box(raw_box)
-
-
 def _normalize_box(raw_box: Any) -> list[list[float]]:
-    box = _to_plain(raw_box)
+    box = _to_plain_py_list(raw_box)
     if _is_rect_like(box):
         x1, y1, x2, y2 = [float(value) for value in box]
         return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
@@ -350,53 +255,21 @@ def _is_rect_like(value: Any) -> bool:
     )
 
 
-def _is_point_like(value: Any) -> bool:
-    return (
-        isinstance(value, list)
-        and len(value) == 2
-        and all(isinstance(item, (int, float)) for item in value)
-    )
-
-
-def _is_box_like(value: Any) -> bool:
-    return _is_rect_like(value) or (
-        isinstance(value, list)
-        and len(value) >= 4
-        and all(_is_point_like(point) for point in value)
-    )
-
-
-def _sequence_get(values: Sequence[Any] | list[Any], index: int) -> Any:
-    if values is None or index >= len(values):
-        return None
-    return values[index]
-
-
-def _optional_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _optional_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    return str(value)
-
-
-def _to_plain(value: Any) -> Any:
+def _to_plain_py_list(value: Any) -> Any:
     if hasattr(value, "tolist") and callable(value.tolist):
         return value.tolist()
-    if isinstance(value, dict):
-        return {key: _to_plain(item) for key, item in value.items()}
     if isinstance(value, tuple):
-        return [_to_plain(item) for item in value]
+        return [_to_plain_py_list(item) for item in value]
     if isinstance(value, list):
-        return [_to_plain(item) for item in value]
+        return [_to_plain_py_list(item) for item in value]
     return value
+
+
+def _required_float(value: Any, field_name: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Expected PaddleOCR payload field {field_name} to be numeric.") from exc
 
 
 def _sorted_keys(payload: dict) -> list[str]:

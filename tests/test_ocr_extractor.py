@@ -3,25 +3,28 @@ import unittest
 from src.ocr_extractor import OCRExtractor
 
 
+class FakePaddleResult:
+    def __init__(self, payload: dict) -> None:
+        self.json = {"res": payload}
+
+
 def make_payload(text: str) -> dict:
     return {
-        "res": {
-            "rec_texts": [text],
-            "rec_scores": [0.99],
-            "rec_polys": [[[0, 0], [20, 0], [20, 10], [0, 10]]],
-            "text_word": [list(text)],
-            "text_word_boxes": [
+        "rec_texts": [text],
+        "rec_scores": [0.99],
+        "rec_polys": [[[0, 0], [20, 0], [20, 10], [0, 10]]],
+        "text_word": [list(text)],
+        "text_word_boxes": [
+            [
                 [
-                    [
-                        [float(index), 0.0],
-                        [float(index + 1), 0.0],
-                        [float(index + 1), 1.0],
-                        [float(index), 1.0],
-                    ]
-                    for index, _ in enumerate(text)
+                    [float(index), 0.0],
+                    [float(index + 1), 0.0],
+                    [float(index + 1), 1.0],
+                    [float(index), 1.0],
                 ]
-            ],
-        }
+                for index, _ in enumerate(text)
+            ]
+        ],
     }
 
 
@@ -29,9 +32,9 @@ class FakeOCR:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def predict(self, image_path: str) -> list[dict]:
+    def predict(self, image_path: str) -> list[FakePaddleResult]:
         self.calls.append(image_path)
-        return [make_payload("学生")]
+        return [FakePaddleResult(make_payload("学生"))]
 
 
 class OCRExtractorTests(unittest.TestCase):
@@ -45,6 +48,8 @@ class OCRExtractorTests(unittest.TestCase):
         self.assertEqual(fake_ocr.calls, ["first.jpg", "second.jpg"])
         self.assertEqual(first_page.full_text, "学生")
         self.assertEqual(second_page.full_text, "学生")
+        self.assertEqual(len(first_page.character_lines), 1)
+        self.assertEqual("".join(char.char for char in first_page.characters), "学生")
 
 
 if __name__ == "__main__":

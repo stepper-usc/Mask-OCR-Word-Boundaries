@@ -3,19 +3,17 @@ import unittest
 from src.models import CharacterBox, OCRPage
 from src.segmenter import (
     add_custom_words,
-    find_character,
-    find_word_for_character,
-    get_characters_for_word_instance,
     iter_word_instances,
     segment_ocr_page,
 )
 
 
 def make_page(line_texts: list[str]) -> OCRPage:
-    characters: list[CharacterBox] = []
+    character_lines: list[list[CharacterBox]] = []
     global_start = 0
 
     for line_id, text in enumerate(line_texts):
+        line_chars: list[CharacterBox] = []
         for char_index, char in enumerate(text):
             global_char_index = global_start + char_index
             char_id = f"l{line_id}_c{char_index}_g{global_char_index}"
@@ -25,7 +23,7 @@ def make_page(line_texts: list[str]) -> OCRPage:
                 [float(char_index + 1), float(line_id + 1)],
                 [float(char_index), float(line_id + 1)],
             ]
-            characters.append(
+            line_chars.append(
                 CharacterBox(
                     id=char_id,
                     char=char,
@@ -36,11 +34,12 @@ def make_page(line_texts: list[str]) -> OCRPage:
                 )
             )
 
+        character_lines.append(line_chars)
         global_start += len(text) + 1
 
     return OCRPage(
         full_text="\n".join(line_texts),
-        characters=characters,
+        character_lines=character_lines,
     )
 
 
@@ -55,33 +54,39 @@ class SegmenterTests(unittest.TestCase):
         self.assertTrue(all(char.word for char in page.characters))
         self.assertTrue(all(char.word_instance_id for char in page.characters))
 
-        student_id_chars = [find_character(page, 0, char_index) for char_index in (4, 5, 6)]
-        word_instance_ids = {char.word_instance_id for char in student_id_chars if char is not None}
+        student_id_chars = page.character_lines[0][4:7]
+        word_instance_ids = {char.word_instance_id for char in student_id_chars}
 
         self.assertEqual(len(word_instance_ids), 1)
         self.assertEqual(student_id_chars[0].word, "学生证")
 
-        word_chars = get_characters_for_word_instance(page, student_id_chars[0].word_instance_id or "")
+        word_chars = [
+            char
+            for char in page.characters
+            if char.word_instance_id == student_id_chars[0].word_instance_id
+        ]
         self.assertEqual("".join(char.char for char in word_chars), "学生证")
 
     def test_repeated_characters_remain_distinct_instances(self) -> None:
         page = make_page(["我的书是他的书"])
 
-        first_de = find_character(page, 0, 1)
-        second_de = find_character(page, 0, 5)
+        first_de = page.character_lines[0][1]
+        second_de = page.character_lines[0][5]
         segment_ocr_page(page)
 
-        self.assertIsNotNone(first_de)
-        self.assertIsNotNone(second_de)
         self.assertEqual(first_de.char, "的")
         self.assertEqual(second_de.char, "的")
         self.assertNotEqual(first_de.id, second_de.id)
-        self.assertEqual(find_word_for_character(page, 0, 1), "的")
-        self.assertEqual(find_word_for_character(page, 0, 5), "的")
+        self.assertEqual(first_de.word, "的")
+        self.assertEqual(second_de.word, "的")
         self.assertNotEqual(first_de.word_instance_id, second_de.word_instance_id)
 
-        first_word_chars = get_characters_for_word_instance(page, first_de.word_instance_id or "")
-        second_word_chars = get_characters_for_word_instance(page, second_de.word_instance_id or "")
+        first_word_chars = [
+            char for char in page.characters if char.word_instance_id == first_de.word_instance_id
+        ]
+        second_word_chars = [
+            char for char in page.characters if char.word_instance_id == second_de.word_instance_id
+        ]
 
         self.assertIn(first_de, first_word_chars)
         self.assertNotIn(second_de, first_word_chars)
@@ -95,10 +100,10 @@ class SegmenterTests(unittest.TestCase):
         segment_ocr_page(page)
 
         self.assertEqual(page.full_text, "学生\n证用")
-        self.assertEqual(find_character(page, 0, 0).global_char_index, 0)
-        self.assertEqual(find_character(page, 0, 1).global_char_index, 1)
-        self.assertEqual(find_character(page, 1, 0).global_char_index, 3)
-        self.assertEqual(find_character(page, 1, 1).global_char_index, 4)
+        self.assertEqual(page.character_lines[0][0].global_char_index, 0)
+        self.assertEqual(page.character_lines[0][1].global_char_index, 1)
+        self.assertEqual(page.character_lines[1][0].global_char_index, 3)
+        self.assertEqual(page.character_lines[1][1].global_char_index, 4)
 
         words = [word for _, word, _ in iter_word_instances(page)]
         self.assertNotIn("学生证用", words)
